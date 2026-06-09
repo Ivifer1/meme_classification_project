@@ -1,0 +1,17 @@
+# Procesamiento de Datos y Álgebra Lineal
+numpy
+pandas
+scikit-learn
+matplotlib
+seaborn
+
+# Visión por Computadora y OCR
+opencv-python-headless
+pillow
+easyocr
+
+# Aprendizaje Profundo e Inteligencia Artificial
+torch
+torchvision
+transformers
+accelerate
