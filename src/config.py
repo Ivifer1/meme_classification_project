@@ -9,6 +9,8 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 RAW_DATA_DIR = os.path.join(DATA_DIR, "raw", "data") 
 SPLITS_DATA_DIR = os.path.join(DATA_DIR, "splits")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+MODEL_PATH = os.path.join(MODELS_DIR, "fusion_mlp_model.pth")
 
 # --- Configuración de Hardware Inteligente (Windows / Mac) ---
 if torch.cuda.is_available():
