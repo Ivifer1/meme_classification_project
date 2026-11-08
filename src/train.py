@@ -1,124 +1,129 @@
+"""Paso 2: entrena la red de fusión (y los dos modelos de una sola modalidad)
+sobre los embeddings precalculados.
+
+- Separa un 10 % de train.jsonl como validación (estratificado)
+- BCEWithLogitsLoss con pos_weight para compensar que hay menos memes de odio
+- AdamW con weight decay, dropout y early stopping según el ROC-AUC de validación
+- Guarda el mejor modelo de cada modo en models/<modo>.pth
+
+Uso:  python -m src.train            (entrena imagen, texto y fusion)
+      python -m src.train --modes fusion
+"""
 import os
+import json
+import argparse
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
-from PIL import Image
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
 
-# 🌟 AGREGA ESTA LÍNEA AQUÍ:
 import src.config as config
-
-# Tus otros imports...
-from src.dataset import HatefulMemesDataset
-from src.features.vision_extractor import MCVisionExtractor 
-from src.features.text_extractor import MCTextExtractor
+from src.dataset import load_feature_split, make_tensor_dataset
 from src.models.fusion_mlp import FusionMLP
 
-def train():
-    print("🚀 INICIANDO FASE DE ENTRENAMIENTO MULTIMODAL...\n")
 
-    # 1. Detectar Dispositivo (Mac/Windows/CPU)
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    print(f"🖥️ Entrenando en dispositivo: {device}\n")
+def set_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    # 2. Preparar los Datos
-    print("📦 Cargando Dataset de Entrenamiento...")
-    train_dataset = HatefulMemesDataset(split="train")
-    # Batch size de 16 es un buen balance para que la Mac no se quede sin memoria
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
 
-    # 3. Inicializar Modelos
-    print("⚙️ Inicializando Extractores y Red de Fusión...")
-    vision_extractor = MCVisionExtractor()
-    text_extractor = MCTextExtractor()
-    
-    fusion_network = FusionMLP().to(device)
-    fusion_network.train() # Ponemos la red en MODO ENTRENAMIENTO
+@torch.no_grad()
+def predict_proba(model, loader, device):
+    model.eval()
+    probs, labels = [], []
+    for v, t, y in loader:
+        logits = model(v.to(device), t.to(device))
+        probs.append(torch.sigmoid(logits).squeeze(1).cpu())
+        labels.append(y)
+    return torch.cat(probs).numpy(), torch.cat(labels).numpy()
 
-    # 4. Configurar Función de Pérdida y Optimizador (Rúbrica Días 3-5)
-    criterion = nn.BCEWithLogitsLoss() # Ideal para clasificar 0 o 1
-    optimizer = optim.Adam(fusion_network.parameters(), lr=0.001) # Optimizador estándar
 
-    # 5. CICLO DE ENTRENAMIENTO (Rúbrica Días 6-7)
-    num_epochs = 3 # Número de pasadas completas al dataset
-    
-    for epoch in range(num_epochs):
-        print(f"\n=====================================")
-        print(f"🔄 ÉPOCA {epoch + 1}/{num_epochs}")
-        print(f"=====================================")
-        
-        running_loss = 0.0
-        
-        for batch_idx, (img_paths, texts, labels) in enumerate(train_loader):
-            # Mover las etiquetas al dispositivo
-            labels = labels.unsqueeze(1).to(device) # Ajustar forma a [batch, 1]
-            
-            # --- FASE 1: EXTRAER CARACTERÍSTICAS (congeladas, sin gradiente) ---
-            vision_features_list = []
-            with torch.no_grad(): 
-                for img_path in img_paths:
-                    try:
-                        img = Image.open(img_path).convert("RGB")
-                    except Exception as e:
-                        img = Image.new('RGB', (224, 224), color='black')
-                    
-                    v_feat = vision_extractor.extract_features(img)
-                    vision_features_list.append(v_feat.view(-1)) 
-                
-                # Apilamos las imágenes [batch_size, 2048]
-                batch_vision_features = torch.stack(vision_features_list, dim=0).to(device)
-                
-                # Extraemos los textos
-                batch_text_features = text_extractor.extract_features(texts).to(device)
-                
-                # 🌟 PARCHE PARA EL ÚLTIMO LOTE 🌟
-                if len(batch_text_features.shape) == 1:
-                    # Si el simulador da un vector 1D (768), lo clonamos para la cantidad exacta de memes (16 o 4)
-                    batch_text_features = batch_text_features.unsqueeze(0).expand(len(texts), -1)
-                elif len(batch_text_features.shape) == 2 and batch_text_features.shape[0] != len(texts):
-                    # Solo por seguridad, si la forma viene rara, forzamos su estructura
-                    batch_text_features = batch_text_features.view(len(texts), -1)
+def split_indices(labels):
+    idx = np.arange(len(labels))
+    return train_test_split(idx, test_size=config.VAL_FRACTION,
+                            stratify=labels, random_state=config.SEED)
 
-            # --- FASE 2: RED DE FUSIÓN Y PREDICCIÓN ---
-            optimizer.zero_grad() # Limpiamos la memoria del optimizador
-            
-            # Pasamos los vectores por la red
-            logits = fusion_network(batch_vision_features, batch_text_features)
-            
-            # --- FASE 3: CALCULAR ERROR (Loss) Y AJUSTAR PESOS ---
-            loss = criterion(logits, labels)
-            loss.backward() # Propagación hacia atrás (Backpropagation)
-            optimizer.step() # Actualizar pesos
-            
-            # Monitoreo de la curva de pérdida
-            running_loss += loss.item()
-            if (batch_idx + 1) % 10 == 0:
-                print(f"   [Batch {batch_idx + 1}/{len(train_loader)}] Training Loss: {loss.item():.4f}")
 
-        # Promedio de pérdida de la época
-        epoch_loss = running_loss / len(train_loader)
-        print(f"✅ FIN ÉPOCA {epoch + 1} | Loss Promedio: {epoch_loss:.4f}")
+def train_mode(mode, feats, train_idx, val_idx, device):
+    set_seed(config.SEED)
+    train_loader = DataLoader(make_tensor_dataset(feats, train_idx), batch_size=config.BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(make_tensor_dataset(feats, val_idx), batch_size=256)
 
-    print("\n🎉 ¡ENTRENAMIENTO COMPLETADO EXITOSAMENTE!")
+    y_train = feats["labels"][train_idx]
+    pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
 
-    # ==========================================
-    # 💾 GUARDAR EL MODELO ENTRENADO
-    # ==========================================
-    # Creamos la ruta usando tu config (ej: models/fusion_mlp_model.pth)
-    model_dir = os.path.dirname(config.MODEL_PATH) if hasattr(config, 'MODEL_PATH') else "models"
-    os.makedirs(model_dir, exist_ok=True)
-    
-    save_path = os.path.join(model_dir, "fusion_mlp_model.pth")
-    print(f"💾 Guardando los pesos del modelo en: {save_path}...")
-    
-    # Guardamos el diccionario de estado del modelo
-    torch.save(fusion_network.state_dict(), save_path)
-    print("✅ ¡Modelo guardado correctamente y listo para ser evaluado!")
+    model = FusionMLP(mode).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+
+    best_auc, best_state, bad_epochs, history = -1.0, None, 0, []
+    for epoch in range(1, config.EPOCHS + 1):
+        model.train()
+        total = 0.0
+        for v, t, y in train_loader:
+            v, t, y = v.to(device), t.to(device), y.unsqueeze(1).to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(v, t), y)
+            loss.backward()
+            optimizer.step()
+            total += loss.item() * len(y)
+        train_loss = total / len(train_loader.dataset)
+
+        val_probs, val_labels = predict_proba(model, val_loader, device)
+        val_auc = roc_auc_score(val_labels, val_probs)
+        history.append({"epoch": epoch, "train_loss": round(train_loss, 4), "val_auc": round(val_auc, 4)})
+        print(f"[{mode}] época {epoch:02d} | loss {train_loss:.4f} | ROC-AUC val {val_auc:.4f}")
+
+        if val_auc > best_auc:
+            best_auc, bad_epochs = val_auc, 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            bad_epochs += 1
+            if bad_epochs >= config.PATIENCE:
+                print(f"[{mode}] early stopping en la época {epoch}")
+                break
+
+    # Umbral de decisión: el que maximiza F1 en validación (no se toca el set de evaluación)
+    model.load_state_dict(best_state)
+    val_probs, val_labels = predict_proba(model, val_loader, device)
+    thresholds = np.linspace(0.1, 0.9, 81)
+    f1s = [f1_at(val_labels, val_probs, th) for th in thresholds]
+    threshold = float(thresholds[int(np.argmax(f1s))])
+
+    os.makedirs(config.MODELS_DIR, exist_ok=True)
+    torch.save({"mode": mode, "state_dict": best_state, "threshold": threshold},
+               os.path.join(config.MODELS_DIR, f"{mode}.pth"))
+    print(f"[{mode}] mejor ROC-AUC val {best_auc:.4f} | umbral {threshold:.2f} | guardado en models/{mode}.pth\n")
+    return {"best_val_auc": round(best_auc, 4), "threshold": threshold, "history": history}
+
+
+def f1_at(y, p, th):
+    pred = p >= th
+    tp = np.sum(pred & (y == 1))
+    fp = np.sum(pred & (y == 0))
+    fn = np.sum(~pred & (y == 1))
+    return 0.0 if tp == 0 else 2 * tp / (2 * tp + fp + fn)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--modes", nargs="+", default=config.MODES)
+    args = parser.parse_args()
+
+    device = config.DEVICE
+    print(f"Entrenando en: {device}\n")
+    feats = load_feature_split("train")
+    train_idx, val_idx = split_indices(feats["labels"].numpy())
+    print(f"Entrenamiento: {len(train_idx)} memes | validación: {len(val_idx)} memes\n")
+
+    summary = {mode: train_mode(mode, feats, train_idx, val_idx, device) for mode in args.modes}
+
+    os.makedirs(config.RESULTS_DIR, exist_ok=True)
+    with open(os.path.join(config.RESULTS_DIR, "training_history.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
 
 if __name__ == "__main__":
-    train()
+    main()

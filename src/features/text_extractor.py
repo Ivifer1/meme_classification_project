@@ -1,61 +1,43 @@
-import sys
 import torch
-import warnings
-warnings.filterwarnings("ignore")
+from transformers import AutoTokenizer, AutoModel
 
 import src.config as config
 
-# Intentamos importar transformers de manera segura
-try:
-    from transformers import DistilBertTokenizer, DistilBertModel
-    TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    TRANSFORMERS_AVAILABLE = False
 
 class MCTextExtractor:
+    """DistilBERT preentrenado y congelado.
+    Devuelve un embedding de 768 dimensiones por texto (mean pooling sobre los tokens)."""
+
     def __init__(self):
-        # DETECCIÓN DE ENTORNO BLOQUEADO (Tu Mac)
-        # Si estás en MacOS, activamos el modo simulación para evitar que tu terminal se congele
-        self.is_mac = (sys.platform == "darwin")
-        
-        if self.is_mac:
-            print(f"[{config.DEVICE}] [MODO MAC/SIMULACIÓN] Extractor de Texto DistilBERT inicializado localmente.")
-            self.device = config.DEVICE
-        else:
-            # ESTE BLOQUE CORRERÁ EN LAS PC EN WINDOWS DE TU EQUIPO
-            print(f"[{config.DEVICE}] Cargando Extractor de Texto Real ({config.TEXT_MODEL_NAME})...")
-            self.tokenizer = DistilBertTokenizer.from_pretrained(config.TEXT_MODEL_NAME)
-            self.model = DistilBertModel.from_pretrained(config.TEXT_MODEL_NAME)
-            
-            # RÚBRICA: Congelar parámetros
-            for param in self.model.parameters():
-                param.requires_grad = False
-                
-            self.device = config.DEVICE
-            self.model.to(self.device)
-            self.model.eval()
+        print(f"[{config.DEVICE}] Cargando extractor de texto ({config.TEXT_MODEL_NAME})...")
+        self.tokenizer = AutoTokenizer.from_pretrained(config.TEXT_MODEL_NAME)
+        self.model = AutoModel.from_pretrained(config.TEXT_MODEL_NAME)
+
+        for param in self.model.parameters():  # extractor congelado
+            param.requires_grad = False
+
+        self.device = config.DEVICE
+        self.model.to(self.device).eval()
+
+    @torch.no_grad()
+    def extract_batch(self, texts):
+        """Lista de textos -> tensor [N, 768]"""
+        texts = [t if t and t.strip() else "[empty]" for t in texts]
+        inputs = self.tokenizer(texts, return_tensors="pt", padding=True,
+                                truncation=True, max_length=config.TEXT_MAX_LENGTH).to(self.device)
+        hidden = self.model(**inputs).last_hidden_state          # [N, tokens, 768]
+
+        # Promedio de los tokens reales de cada texto (sin contar el padding)
+        mask = inputs["attention_mask"].unsqueeze(-1).float()
+        embeddings = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        return embeddings.cpu()
 
     def extract_features(self, text):
-        """Recibe una cadena de texto y retorna un tensor de tamaño [768]"""
-        if self.is_mac:
-            # En tu Mac, genera instantáneamente un vector con la dimensión matemática exacta
-            # Esto te permite avanzar con la fusión multimodal sin trabarte por la red
-            torch.manual_seed(42) # Semilla para reproducibilidad
-            return torch.randn(768).to(self.device)
-        
-        # En Windows procesará el texto real
-        if not text or not text.strip():
-            text = "empty"
+        """Un texto -> tensor [768]"""
+        return self.extract_batch([text])[0]
 
-        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=128)
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            
-        return outputs.last_hidden_state[0, 0, :]
 
 if __name__ == "__main__":
     extractor = MCTextExtractor()
-    vector = extractor.extract_features("Meme text extraction sample.")
-    print(f"-> Extracción de texto exitosa. Tamaño del embedding: {vector.shape} (Esperado: [768])")
+    vectors = extractor.extract_batch(["meme text sample", "another different meme"])
+    print(f"Embeddings de texto: {tuple(vectors.shape)} (esperado: (2, 768))")
