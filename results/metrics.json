@@ -1,0 +1,39 @@
+{
+  "split": "dev",
+  "n": 500,
+  "positivos": 250,
+  "modelos": {
+    "imagen": {
+      "accuracy": 0.542,
+      "precision": 0.5271,
+      "recall": 0.816,
+      "f1": 0.6405,
+      "roc_auc": 0.5742,
+      "threshold": 0.36
+    },
+    "texto": {
+      "accuracy": 0.58,
+      "precision": 0.6075,
+      "recall": 0.452,
+      "f1": 0.5183,
+      "roc_auc": 0.6308,
+      "threshold": 0.51
+    },
+    "late_fusion": {
+      "accuracy": 0.59,
+      "precision": 0.5753,
+      "recall": 0.688,
+      "f1": 0.6266,
+      "roc_auc": 0.6429,
+      "threshold": 0.435
+    },
+    "fusion": {
+      "accuracy": 0.626,
+      "precision": 0.6567,
+      "recall": 0.528,
+      "f1": 0.5854,
+      "roc_auc": 0.6716,
+      "threshold": 0.42
+    }
+  }
+}
